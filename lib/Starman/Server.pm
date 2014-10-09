@@ -275,7 +275,7 @@ sub process_request {
             $self->{client}->{keepalive} = 0;
         }
 
-        $self->_prepare_env($env);
+        last if !$self->_prepare_env($env);
 
         # Run PSGI apps
         my $res = Plack::Util::run_app($self->{app}, $env);
@@ -402,55 +402,76 @@ sub _prepare_env {
     };
 
     my $chunked = do { no warnings; lc delete $env->{HTTP_TRANSFER_ENCODING} eq 'chunked' };
+    eval {
+        local $SIG{ALRM} = sub { die "Timed out\n"; };
 
-    if (my $cl = $env->{CONTENT_LENGTH}) {
-        my $buf = Plack::TempBuffer->new($cl);
-        while ($cl > 0) {
-            my($chunk, $read) = $get_chunk->();
+        alarm( $self->{options}->{read_timeout} );
 
-            if ( !defined $read || $read == 0 ) {
-                die "Read error: $!\n";
-            }
+        if (my $cl = $env->{CONTENT_LENGTH}) {
+            my $buf = Plack::TempBuffer->new($cl);
+            while ($cl > 0) {
+                my($chunk, $read) = $get_chunk->();
 
-            $cl -= $read;
-            $buf->print($chunk);
-        }
-        $env->{'psgi.input'} = $buf->rewind;
-    } elsif ($chunked) {
-        my $buf = Plack::TempBuffer->new;
-        my $chunk_buffer = '';
-        my $length;
-
-    DECHUNK:
-        while (1) {
-            my($chunk, $read) = $get_chunk->();
-            $chunk_buffer .= $chunk;
-
-            while ( $chunk_buffer =~ s/^(([0-9a-fA-F]+).*\015\012)// ) {
-                my $trailer   = $1;
-                my $chunk_len = hex $2;
-
-                if ($chunk_len == 0) {
-                    last DECHUNK;
-                } elsif (length $chunk_buffer < $chunk_len + 2) {
-                    $chunk_buffer = $trailer . $chunk_buffer;
-                    last;
+                if ( !defined $read || $read == 0 ) {
+                    die "Read error: $!\n";
                 }
 
-                $buf->print(substr $chunk_buffer, 0, $chunk_len, '');
-                $chunk_buffer =~ s/^\015\012//;
+                $cl -= $read;
+                $buf->print($chunk);
+            }
+            $env->{'psgi.input'} = $buf->rewind;
+        } elsif ($chunked) {
+            my $buf = Plack::TempBuffer->new;
+            my $chunk_buffer = '';
+            my $length;
 
-                $length += $chunk_len;
+        DECHUNK:
+            while (1) {
+                my($chunk, $read) = $get_chunk->();
+                $chunk_buffer .= $chunk;
+
+                while ( $chunk_buffer =~ s/^(([0-9a-fA-F]+).*\015\012)// ) {
+                    my $trailer   = $1;
+                    my $chunk_len = hex $2;
+
+                    if ($chunk_len == 0) {
+                        last DECHUNK;
+                    } elsif (length $chunk_buffer < $chunk_len + 2) {
+                        $chunk_buffer = $trailer . $chunk_buffer;
+                        last;
+                    }
+
+                    $buf->print(substr $chunk_buffer, 0, $chunk_len, '');
+                    $chunk_buffer =~ s/^\015\012//;
+
+                    $length += $chunk_len;
+                }
+
+                last unless $read && $read > 0;
             }
 
-            last unless $read && $read > 0;
+            $env->{CONTENT_LENGTH} = $length;
+            $env->{'psgi.input'}   = $buf->rewind;
+        } else {
+            $env->{'psgi.input'} = $null_io;
+        }
+    };
+
+    alarm(0);
+
+    if ( $@ ) {
+        if ( $@ =~ /Timed out/ ) {
+            DEBUG && warn "[$$] Client connection timed out\n";
+            return;
         }
 
-        $env->{CONTENT_LENGTH} = $length;
-        $env->{'psgi.input'}   = $buf->rewind;
-    } else {
-        $env->{'psgi.input'} = $null_io;
+        if ( $@ =~ /Read error/ ) {
+            DEBUG && warn "[$$] Read error: $!\n";
+            return;
+        }
     }
+    
+    return 1;
 }
 
 sub _finalize_response {
